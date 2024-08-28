@@ -1,0 +1,8 @@
+Django==4.0.10
+mediapipe==0.10.14
+numpy==2.1.0
+opencv_contrib_python==4.10.0.84
+opencv_python==4.10.0.82
+pygame==2.6.0
+tensorflow==2.17.0
+tensorflow_intel==2.17.0
