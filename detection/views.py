@@ -6,6 +6,7 @@ import pygame
 import time
 from django.http import StreamingHttpResponse
 import os
+import threading
 
 # Initialize pygame mixer
 pygame.mixer.init()
@@ -27,6 +28,26 @@ mp_hands = mp.solutions.hands
 hands = mp_hands.Hands(static_image_mode=False, max_num_hands=1, min_detection_confidence=0.8)
 mp_drawing = mp.solutions.drawing_utils
 
+# Global variables for multi-threading
+global_frame = None
+frame_lock = threading.Lock()
+
+def capture_frames():
+    global global_frame
+    cap = cv2.VideoCapture(1)
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        with frame_lock:
+            global_frame = frame.copy()
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    cap.release()
+
 def play_sound(audio_file):
     try:
         pygame.mixer.music.load(audio_file)
@@ -47,60 +68,61 @@ def extract_hand_landmarks(image):
     return None, None
 
 def gen_frames():
-    cap = cv2.VideoCapture(0)
     x, y, w, h = 200, 100, 300, 300
     detection_interval_1 = 30  # seconds
     detection_interval_2 = 40  # seconds
 
+    # Start the thread to capture frames
+    frame_thread = threading.Thread(target=capture_frames)
+    frame_thread.start()
+
+    last_detection_time = time.time()
+    head_detected = False
+    current_audio_file = None
+
     while True:
-        last_detection_time = time.time()
-        head_detected = False
-        current_audio_file = None
+        with frame_lock:
+            if global_frame is None:
+                continue
+            frame = global_frame.copy()
 
-        while not head_detected:
-            ret, frame = cap.read()
-            if not ret:
-                break
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
 
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
+        detected = any((fx >= x and fy >= y and fx + fw <= x + w and fy + fh <= y + h) for fx, fy, fw, fh in faces)
+        elapsed_time = time.time() - last_detection_time
 
-            detected = any((fx >= x and fy >= y and fx + fw <= x + w and fy + fh <= y + h) for fx, fy, fw, fh in faces)
-            elapsed_time = time.time() - last_detection_time
+        if elapsed_time > detection_interval_2:
+            circle_color = (0, 0, 255)
+            audio_file = os.path.join(os.path.dirname(__file__), '..', 'savedmodel', 'alert-33762.mp3')
+        elif elapsed_time > detection_interval_1:
+            circle_color = (0, 255, 255)
+            audio_file = os.path.join(os.path.dirname(__file__), '..', 'savedmodel', 'weeb-alert-182941.mp3')
+        else:
+            circle_color = (0, 0, 0)
+            audio_file = None
 
-            if elapsed_time > detection_interval_2:
-                circle_color = (0, 0, 255)
-                audio_file = os.path.join(os.path.dirname(__file__), '..', 'savedmodel', 'alert-33762.mp3')
-            elif elapsed_time > detection_interval_1:
-                circle_color = (0, 255, 255)
-                audio_file = os.path.join(os.path.dirname(__file__), '..', 'savedmodel', 'weeb-alert-182941.mp3')
-            else:
-                circle_color = (0, 0, 0)
-                audio_file = None
+        if audio_file != current_audio_file:
+            stop_sound()
+            if audio_file:
+                play_sound(audio_file)
+            current_audio_file = audio_file
 
-            if audio_file != current_audio_file:
-                stop_sound()
-                if audio_file:
-                    play_sound(audio_file)
-                current_audio_file = audio_file
+        cv2.circle(frame, (100, 50), 20, circle_color, -1)
+        cv2.putText(frame, "Yes" if detected else "No", (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0) if detected else (0, 0, 255), 2)
 
-            cv2.circle(frame, (100, 50), 20, circle_color, -1)
-            cv2.putText(frame, "Yes" if detected else "No", (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0) if detected else (0, 0, 255), 2)
+        if detected:
+            head_detected = True
+            stop_sound()
 
-            if detected:
-                head_detected = True
-                stop_sound()
+        ret, buffer = cv2.imencode('.jpg', frame)
+        frame = buffer.tobytes()
 
-            ret, buffer = cv2.imencode('.jpg', frame)
-            frame = buffer.tobytes()
+        yield (b'--frame\r\n'
+               b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
 
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
-
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                cap.release()
-                cv2.destroyAllWindows()
-                break
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
 
         if head_detected:
             last_label = None
@@ -109,9 +131,10 @@ def gen_frames():
             hand_detection_timeout = 10  # seconds
 
             while True:
-                success, image = cap.read()
-                if not success:
-                    break
+                with frame_lock:
+                    if global_frame is None:
+                        continue
+                    image = global_frame.copy()
 
                 landmarks, results = extract_hand_landmarks(image)
                 if landmarks is not None:
@@ -123,7 +146,6 @@ def gen_frames():
                     class_labels = {0: 'Normal', 1: 'Sign 1', 2: 'Sign 2'}
                     label = class_labels.get(class_id, 'Unknown')
 
-                    # label = 'Normal' if class_id == 0 else ('Sign 1' if class_id == 1 else 'Sign 2')
                     if class_id == 0:
                         label = 'Normal'
                         audio_file = None
@@ -170,11 +192,8 @@ def gen_frames():
                        b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
 
                 if cv2.waitKey(5) & 0xFF == 27:  # Press 'Esc' to exit
-                    cap.release()
-                    cv2.destroyAllWindows()
                     break
 
-    cap.release()
     cv2.destroyAllWindows()
 
 def video_feed(request):
